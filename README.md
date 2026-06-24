@@ -74,6 +74,10 @@ python sidecar/infinary_agent.py
 | `INFINARY_HEARTBEAT_SEC` | `45` | loop cadence |
 | `INFINARY_DRYRUN` | — | `1` fakes the bench (heartbeat + upgrade) for local testing |
 | `INFINARY_DRYRUN_VERSION` | `15` | dry-run ERPNext version — a step behind LATEST so a dry-run demos an upgrade |
+| `INFINARY_UPGRADE_DRIVER` | `bench` | `bench` (bare bench) or `compose` (frappe_docker: image swap) — see [Major upgrades](#major-upgrades) |
+| `INFINARY_TARGET_IMAGE` | — | compose driver: the image to upgrade to (or the job's `targetImage`) |
+| `INFINARY_COMPOSE_DIR` | `/opt/erpnext` | compose driver: dir holding the compose file |
+| `INFINARY_COMPOSE_SERVICE` | `backend` | compose driver: the frappe service name |
 
 ### Quick local test (no Frappe)
 
@@ -82,6 +86,28 @@ INFINARY_CONTROL_PLANE=http://localhost:8080 INFINARY_INSTANCE_ID=inst_demo \
 INFINARY_AGENT_TOKEN=agt_demo INFINARY_DRYRUN=1 INFINARY_HEARTBEAT_SEC=2 \
 python sidecar/infinary_agent.py
 ```
+
+## Major upgrades
+
+A major upgrade is topology-specific, so the sidecar selects a **driver** via
+`INFINARY_UPGRADE_DRIVER`:
+
+- **`bench`** (bare bench): `bench switch-to-branch version-N --upgrade`, then `migrate`.
+- **`compose`** (frappe_docker): the app code lives in the **image**, not a volume, so
+  the version change is an **image swap + recreate**; the persistent DB/sites volume is
+  then migrated. This is what Infinary-managed (frappe_docker) instances use.
+
+Both run the same five stages — `backing_up → offline → installing → migrating →
+final_checks` — emitting a stage event per step. On **any** failure the driver rolls
+back: the compose driver reverts the image (recreate) and restores the pre-upgrade DB
+backup, then brings the site online. The compose driver **refuses to run without a
+target image** (fail-closed); the image comes from the job payload `targetImage` or
+`INFINARY_TARGET_IMAGE`.
+
+> Building the target image (a golden ERPNext-vN image with the managed apps layered
+> in) is a separate pipeline; the agent only **swaps + migrates + rolls back**. The
+> heavier disk-snapshot rollback (for a corrupted volume) is orchestrated by the
+> control plane, not the in-box agent.
 
 ## Default install on managed instances
 
