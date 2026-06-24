@@ -1,0 +1,19 @@
+[project]
+name = "infinary_agent"
+authors = [
+    { name = "Infinary", email = "ops@infinary.io" },
+]
+description = "Infinary's outbound site agent: version + drift fingerprint for managed ERPNext upgrades."
+requires-python = ">=3.10"
+readme = "README.md"
+dynamic = ["version"]
+dependencies = [
+    # frappe is provided by the bench; nothing else is needed inside Frappe.
+]
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+# Deliberately no [tool.bench.frappe-dependencies] version pin — this app installs
+# unchanged on the ERPNext versions Infinary manages (v15 and v16).
