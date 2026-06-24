@@ -58,6 +58,9 @@ DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
 AGENT_VERSION = "0.4.0"
+# The Frappe-app version is read from the live site fingerprint; this is only the
+# dry-run fallback (kept in sync with infinary_agent/__init__.py for local demos).
+AGENT_APP_VERSION_DRYRUN = "0.3.2"
 
 S = requests.Session()
 S.headers["Authorization"] = f"Bearer {TOKEN}"
@@ -126,6 +129,7 @@ def collect_reported_state() -> dict:
             },
             "lastUpdateOutcome": "none",
             "agentVersion": AGENT_VERSION,
+            "agentAppVersion": AGENT_APP_VERSION_DRYRUN,
             "platform": {"python": "3.11.0", "mariadb": "11.8.0"},
             "dataHealth": {"pendingPatches": 0, "failedPatches": 0},
             "aiSpendCents": 0,
@@ -141,6 +145,7 @@ def collect_reported_state() -> dict:
         "aiSpendCents": fp.get("aiSpendCents", 0),
         "lastUpdateOutcome": fp.get("lastUpdateOutcome", "none"),
         "agentVersion": AGENT_VERSION,
+        "agentAppVersion": fp.get("agentAppVersion"),
     }
 
 

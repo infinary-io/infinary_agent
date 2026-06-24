@@ -12,6 +12,8 @@ from pathlib import Path
 
 import frappe
 
+from infinary_agent import __version__ as APP_VERSION
+
 # UI-driven customizations a filesystem hash CANNOT see — the false-green source.
 # (User-created DocTypes are handled separately: there is no "Custom DocType"
 # doctype — they are DocType rows flagged custom=1.)
@@ -159,4 +161,6 @@ def fingerprint() -> dict:
         "dataHealth": _data_health(),
         "aiSpendCents": _ai_spend_cents(),
         "lastUpdateOutcome": "none",
+        # The installed Frappe-app version, reported separately from the sidecar's own version.
+        "agentAppVersion": APP_VERSION,
     }
