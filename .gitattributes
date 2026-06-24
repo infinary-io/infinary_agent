@@ -1,0 +1,7 @@
+# These run on Linux benches — keep LF in the repo regardless of checkout OS.
+* text=auto eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
