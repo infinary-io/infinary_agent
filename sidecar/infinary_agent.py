@@ -61,9 +61,14 @@ def _bench(*args: str, timeout: int = 3600) -> str:
 
 
 def _bench_json(method: str) -> dict:
-    """Call a whitelisted infinary_agent method and parse its JSON stdout."""
+    """Call a whitelisted infinary_agent method and parse its JSON stdout. `bench
+    execute` serialises the return value to JSON on the last line; some versions
+    JSON-encode it a second time, so decode again if we still hold a string."""
     out = _bench("--site", SITE, "execute", method, timeout=180)
-    return json.loads(out.strip().splitlines()[-1])
+    data = json.loads(out.strip().splitlines()[-1])
+    if isinstance(data, str):
+        data = json.loads(data)
+    return data
 
 
 def _health() -> str:

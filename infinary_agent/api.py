@@ -7,7 +7,6 @@ site's version vector + dual drift fingerprint. Nothing here listens on the
 network and nothing here writes: the app observes, the sidecar reports home.
 """
 import hashlib
-import json
 from pathlib import Path
 
 import frappe
@@ -90,9 +89,10 @@ def _version_vector() -> dict:
 
 
 @frappe.whitelist()
-def fingerprint() -> str:
-    """Returns the version vector + the dual drift fingerprint as a JSON string
-    (the sidecar reads the last stdout line from `bench execute`)."""
+def fingerprint() -> dict:
+    """Returns the version vector + the dual drift fingerprint. `bench execute`
+    serialises this dict to one line of JSON, which the sidecar parses; it is also
+    directly callable over Frappe's whitelisted-method API."""
     fs_hash = _filesystem_hash()
     db_hash, detected = _db_customizations()
     # DB customizations are self-evident drift; filesystem drift is decided by the
@@ -104,15 +104,13 @@ def fingerprint() -> str:
         or detected["customDoctypes"]
         or detected["customApps"]
     )
-    return json.dumps(
-        {
-            "versionVector": _version_vector(),
-            "drift": {
-                "filesystemHash": fs_hash,
-                "dbCustomizationsHash": db_hash,
-                "hasDrift": has_drift,
-                "detected": detected,
-            },
-            "lastUpdateOutcome": "none",
-        }
-    )
+    return {
+        "versionVector": _version_vector(),
+        "drift": {
+            "filesystemHash": fs_hash,
+            "dbCustomizationsHash": db_hash,
+            "hasDrift": has_drift,
+            "detected": detected,
+        },
+        "lastUpdateOutcome": "none",
+    }
