@@ -26,6 +26,7 @@ Env:
   INFINARY_TARGET_IMAGE    compose driver: image to upgrade to (or job payload "targetImage")
   INFINARY_COMPOSE_DIR     compose driver: dir with the compose file (default /opt/erpnext)
   INFINARY_COMPOSE_SERVICE compose driver: the frappe service name (default backend)
+  INFINARY_DB_ROOT_PASSWORD  compose driver: DB root password for restore-on-rollback
 """
 from __future__ import annotations
 
@@ -52,9 +53,11 @@ COMPOSE_DIR = os.environ.get("INFINARY_COMPOSE_DIR", "/opt/erpnext")
 COMPOSE_FILE = os.environ.get("INFINARY_COMPOSE_FILE", "compose.yml")
 COMPOSE_SERVICE = os.environ.get("INFINARY_COMPOSE_SERVICE", "backend")
 TARGET_IMAGE_ENV = os.environ.get("INFINARY_TARGET_IMAGE", "")
+# compose driver: DB root password so `bench restore` on rollback is non-interactive.
+DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
-AGENT_VERSION = "0.3.0"
+AGENT_VERSION = "0.3.1"
 
 S = requests.Session()
 S.headers["Authorization"] = f"Bearer {TOKEN}"
@@ -279,9 +282,13 @@ class ComposeDriver(_Driver):
             except Exception as e:
                 log(f"image revert failed: {e}")
         db = ctx.get("db_backup")
-        if db:
+        if db and DB_ROOT_PASSWORD:
             log(f"restoring the DB from {db}")
-            _bench("--site", SITE, "restore", db, "--force", timeout=3600)
+            _bench("--site", SITE, "restore", db,
+                   "--db-root-password", DB_ROOT_PASSWORD, "--force", timeout=3600)
+        elif db:
+            log("DB restore SKIPPED: set INFINARY_DB_ROOT_PASSWORD to enable it "
+                "(reverted the image only)")
         self.online(ctx)
 
 

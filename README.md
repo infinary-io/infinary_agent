@@ -78,6 +78,7 @@ python sidecar/infinary_agent.py
 | `INFINARY_TARGET_IMAGE` | — | compose driver: the image to upgrade to (or the job's `targetImage`) |
 | `INFINARY_COMPOSE_DIR` | `/opt/erpnext` | compose driver: dir holding the compose file |
 | `INFINARY_COMPOSE_SERVICE` | `backend` | compose driver: the frappe service name |
+| `INFINARY_DB_ROOT_PASSWORD` | — | compose driver: DB root password so restore-on-rollback runs non-interactively |
 
 ### Quick local test (no Frappe)
 
