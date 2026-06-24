@@ -27,14 +27,39 @@ Env:
   INFINARY_COMPOSE_DIR     compose driver: dir with the compose file (default /opt/erpnext)
   INFINARY_COMPOSE_SERVICE compose driver: the frappe service name (default backend)
   INFINARY_DB_ROOT_PASSWORD  compose driver: DB root password for restore-on-rollback
+
+  Auto-update engine (scheduled point updates + always-on security patches):
+  INFINARY_POINT_IMAGE_TEMPLATE  pinned image for a point update, {version}/{major} expand
+                                 (e.g. "infinary/erpnext-fac:v{major}-{version}"); unset ⇒
+                                 point auto-update is disabled (fail-closed)
+  INFINARY_SECURITY_WINDOW       default daily window for always-on security patches (HH:MM, default 01:00)
+  INFINARY_SECURITY_WINDOW_MIN   security window length in minutes (default 180)
+  INFINARY_FORCE_WINDOW          "1" → ignore the clock window (testing only)
+
+  Blue/green self-update (the OS supervisor owns the restart — never in-process):
+  INFINARY_SELF_UPDATE_DIR       base dir holding releases/<v> + the `current` symlink the
+                                 service runs; unset ⇒ self-update is skipped
+  INFINARY_SELF_UPDATE_RESTART   restart command (default "sudo systemctl restart infinary-agent")
+
+  Run with `--selfcheck` to validate a staged release (imports + required env) → exit 0/1.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
+import sys
+import tempfile
 import time
+from datetime import datetime, timezone
+
+try:  # Python 3.9+ stdlib; the box ships 3.11
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
 
 import requests  # pip install requests
 
@@ -57,10 +82,25 @@ TARGET_IMAGE_ENV = os.environ.get("INFINARY_TARGET_IMAGE", "")
 DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
-AGENT_VERSION = "0.5.0"
+AGENT_VERSION = "0.6.0"
 # The Frappe-app version is read from the live site fingerprint; this is only the
 # dry-run fallback (kept in sync with infinary_agent/__init__.py for local demos).
 AGENT_APP_VERSION_DRYRUN = "0.3.2"
+
+# ── Auto-update engine config ─────────────────────────────────────────────
+# Point updates apply via a PINNED image swap (compose) — the agent never runs an
+# unbounded `bench update --pull`. The template turns an approved version into the exact
+# image tag; unset ⇒ point auto-update can't run (fail-closed). {version}/{major} expand.
+POINT_IMAGE_TEMPLATE = os.environ.get("INFINARY_POINT_IMAGE_TEMPLATE", "")
+# Security patches are always-on (the covenant). Absent a customer window they apply inside
+# this conservative default daily window (instance-local time).
+SECURITY_WINDOW = os.environ.get("INFINARY_SECURITY_WINDOW", "01:00")
+SECURITY_WINDOW_MIN = int(os.environ.get("INFINARY_SECURITY_WINDOW_MIN", "180"))
+# Blue/green self-update: releases unpack under RELEASE_DIR/<version>; CURRENT is the symlink
+# the service runs (ExecStart=python $CURRENT/infinary_agent.py). Restart is owned by the OS
+# supervisor — the agent never restarts itself in-process (the rollback-executor hazard).
+SELF_UPDATE_DIR = os.environ.get("INFINARY_SELF_UPDATE_DIR", "")  # e.g. /opt/infinary-agent
+SELF_UPDATE_RESTART = shlex.split(os.environ.get("INFINARY_SELF_UPDATE_RESTART", "sudo systemctl restart infinary-agent"))
 
 S = requests.Session()
 S.headers["Authorization"] = f"Bearer {TOKEN}"
@@ -68,6 +108,12 @@ S.headers["Authorization"] = f"Bearer {TOKEN}"
 # In dry-run the agent keeps an in-process version so a successful upgrade visibly
 # bumps what subsequent heartbeats report.
 _dry_version = os.environ.get("INFINARY_DRYRUN_VERSION", "15")
+
+# Desired-state captured from the most recent heartbeat response, so collect_reported_state()
+# can compute availableAgentVersion + echo pending updates for portal visibility.
+_latest_agent_version: str | None = None
+_pending_updates: list[dict] = []
+_agent_artifact: dict | None = None
 
 
 def log(msg: str) -> None:
@@ -113,6 +159,31 @@ def _health() -> str:
         return "degraded"
 
 
+def _cmp_version(a: str, b: str) -> int:
+    """Numeric dotted-version compare: -1 / 0 / 1. Non-numeric chunks count as 0."""
+    def parts(v: str) -> list[int]:
+        out = []
+        for chunk in str(v).split("."):
+            try:
+                out.append(int(chunk))
+            except ValueError:
+                out.append(0)
+        return out
+    pa, pb = parts(a), parts(b)
+    for i in range(max(len(pa), len(pb))):
+        d = (pa[i] if i < len(pa) else 0) - (pb[i] if i < len(pb) else 0)
+        if d:
+            return -1 if d < 0 else 1
+    return 0
+
+
+def _agent_update_available() -> str | None:
+    """The newer sidecar version the control plane offers (null = on latest / unknown)."""
+    if _latest_agent_version and _cmp_version(AGENT_VERSION, _latest_agent_version) < 0:
+        return _latest_agent_version
+    return None
+
+
 def collect_reported_state() -> dict:
     if DRYRUN:
         return {
@@ -133,6 +204,8 @@ def collect_reported_state() -> dict:
             "platform": {"python": "3.11.0", "mariadb": "11.8.0"},
             "dataHealth": {"pendingPatches": 0, "failedPatches": 0},
             "aiSpendCents": 0,
+            "availableAppUpdates": list(_pending_updates),
+            "availableAgentVersion": _agent_update_available(),
         }
     fp = _bench_json("infinary_agent.api.fingerprint")
     return {
@@ -146,6 +219,9 @@ def collect_reported_state() -> dict:
         "lastUpdateOutcome": fp.get("lastUpdateOutcome", "none"),
         "agentVersion": AGENT_VERSION,
         "agentAppVersion": fp.get("agentAppVersion"),
+        # Echo the control-plane-curated pending updates (visibility) + the self-update signal.
+        "availableAppUpdates": list(_pending_updates),
+        "availableAgentVersion": _agent_update_available(),
     }
 
 
@@ -406,10 +482,19 @@ ACTION_HANDLERS = {
 
 
 def run_job(job: dict) -> None:
-    """Dispatch a pulled job by type: the 5-stage major upgrade, or a simple action."""
+    """Dispatch a pulled job by type: the 5-stage major upgrade, a simple action, or a
+    staff-forced blue/green agent self-update."""
     jtype = job.get("type")
     if jtype == "major_upgrade":
         run_upgrade(job)
+        return
+    if jtype == "agent_update":
+        # Staff-forced self-update (the canary/expedited path) — uses the server-pinned artifact
+        # from the latest heartbeat; the run is reported on the pulled job's id (runType=action).
+        if _agent_artifact:
+            run_agent_self_update(_agent_artifact, job["id"], "action")
+        else:
+            _emit_action(job["id"], kind="terminal", outcome="skipped", message="No server-pinned agent artifact configured")
         return
     handler = ACTION_HANDLERS.get(jtype)
     if handler is None:
@@ -418,30 +503,320 @@ def run_job(job: dict) -> None:
     handler(job)
 
 
+# ── Auto-update engine (scheduled point updates + always-on security patches) ──
+# Outbound-pure: at window time the agent ANNOUNCES the run to the control plane (which
+# re-checks the kill-switch / plan / single-flight and opens a durable ledger record), then
+# applies the control-plane-CURATED point updates under a LOCAL snapshot + auto-rollback.
+# Real per-app "what's available" detection from a locked-down box is an open problem; the
+# apply-list is curated centrally (APPROVED_POINT_TARGETS) so rollout is reviewable + haltable.
+FORCE_WINDOW = os.environ.get("INFINARY_FORCE_WINDOW") == "1"  # testing: bypass the clock window
+
+
+def _now_local(tz_name: str | None) -> datetime:
+    if tz_name and ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def _within_window(time_str: str, window_min: int, tz_name: str | None) -> bool:
+    if FORCE_WINDOW:
+        return True
+    try:
+        hh, mm = (int(x) for x in str(time_str).split(":"))
+    except Exception:
+        return False
+    now = _now_local(tz_name)
+    start = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    minutes_since = (now - start).total_seconds() / 60.0
+    return 0 <= minutes_since < max(1, window_min)
+
+
+def _wait_ready(tries: int = 30) -> None:
+    for _ in range(tries):
+        try:
+            _bench("--site", SITE, "execute", "frappe.ping", timeout=30)
+            return
+        except Exception:
+            time.sleep(5)
+    raise RuntimeError("backend did not come ready after recreate")
+
+
+def _begin_run(kind: str, scope: str | None, summary: str | None) -> str | None:
+    """Announce a run; the control plane re-checks paused/plan/single-flight and returns a jobId
+    (or refuses → None, so we retry next cycle)."""
+    try:
+        r = S.post(f"{CP}/v1/agent/{IID}/auto-update/begin", timeout=30,
+                   json={"kind": kind, "scope": scope, "summary": summary})
+        if r.status_code == 202:
+            return r.json().get("jobId")
+        log(f"auto-update/begin refused ({r.status_code}): {r.text[:160]}")
+    except Exception as e:
+        log(f"auto-update/begin error: {e}")
+    return None
+
+
+def _capability_ready() -> tuple[bool, str]:
+    """Fail-CLOSED pre-flight: only auto-apply when we can genuinely roll back."""
+    if DRYRUN:
+        return True, ""
+    if UPGRADE_DRIVER != "compose":
+        return False, "point auto-update requires the compose driver"
+    if not POINT_IMAGE_TEMPLATE:
+        return False, "INFINARY_POINT_IMAGE_TEMPLATE not set (no pinned image target)"
+    if not DB_ROOT_PASSWORD:
+        return False, "INFINARY_DB_ROOT_PASSWORD not set (cannot restore on rollback)"
+    return True, ""
+
+
+def _point_image(updates: list[dict]) -> str:
+    """The single pinned image that realises these point updates (bounded — same-major)."""
+    erp = next((u for u in updates if u.get("name") == "erpnext"), updates[0])
+    version = str(erp["availableVersion"])
+    return POINT_IMAGE_TEMPLATE.format(version=version, major=version.split(".")[0])
+
+
+def run_managed_update(kind: str, run_type: str, updates: list[dict], scope: str | None) -> None:
+    """Snapshot → pinned-image apply → migrate → verify, rolling back on any failure."""
+    if not updates:
+        return
+    summary = ", ".join(f"{u['name']} {u['currentVersion']}->{u['availableVersion']}" for u in updates)
+    jid = _begin_run(kind, scope, summary[:480])
+    if not jid:
+        return  # refused (paused / single-flight / plan) — retry next cycle
+
+    def ev(**e):
+        emit(jid, runType=run_type, **e)
+
+    ctx: dict = {}
+    try:
+        ev(kind="stage", stage="working", stageStatus="started", message=f"Checking update safety: {summary}")
+        ok, why = _capability_ready()
+        if not ok:
+            log(f"managed update skipped (fail-closed): {why}")
+            ev(kind="terminal", outcome="skipped", message=f"Skipped: {why}")
+            return
+        if DRYRUN:
+            time.sleep(2)
+            global _dry_version
+            _dry_version = str(updates[-1]["availableVersion"])
+            ev(kind="terminal", outcome="success", message=f"Applied {summary}")
+            return
+        # 1) snapshot — the rollback source (fail-closed if we can't capture a restorable dump)
+        ev(kind="stage", stage="backing_up", stageStatus="started", message="Taking a snapshot first")
+        ctx["old_image"] = _compose_image()
+        _bench("--site", SITE, "backup", "--with-files")
+        try:
+            out = _compose("exec", "-T", COMPOSE_SERVICE, "bash", "-lc",
+                           f"ls -t sites/{SITE}/private/backups/*-database.sql.gz | head -1", timeout=120)
+            ctx["db_backup"] = out.strip() or None
+        except Exception as e:
+            ctx["db_backup"] = None
+            log(f"could not locate DB backup: {e}")
+        if not ctx.get("db_backup"):
+            ev(kind="terminal", outcome="skipped", message="Skipped: could not capture a restorable backup")
+            return
+        ev(kind="stage", stage="backing_up", stageStatus="completed")
+        # 2) apply via a PINNED image swap (bounded; never an unbounded `bench update --pull`)
+        target = _point_image(updates)
+        ev(kind="stage", stage="installing", stageStatus="started", message=f"Applying {summary}")
+        try:
+            _run(["docker", "image", "inspect", target], timeout=60)
+        except Exception:
+            _run(["docker", "pull", target], timeout=1800)
+        _compose_set_image(ctx["old_image"], target)
+        ctx["image_swapped"] = True
+        _compose("up", "-d", timeout=1800)
+        _wait_ready()
+        ev(kind="stage", stage="installing", stageStatus="completed")
+        ev(kind="stage", stage="migrating", stageStatus="started", message="Applying to your records")
+        _bench("--site", SITE, "migrate")
+        ev(kind="stage", stage="migrating", stageStatus="completed")
+        # 3) verify
+        ev(kind="stage", stage="final_checks", stageStatus="started", message="Running smoke checks")
+        _bench("--site", SITE, "execute", "frappe.ping", timeout=120)
+        ev(kind="stage", stage="final_checks", stageStatus="completed")
+        ev(kind="terminal", outcome="success", message=f"Applied {summary}")
+        log(f"managed update applied: {summary}")
+    except Exception as e:
+        log(f"managed update failed, rolling back: {e}")
+        try:
+            if ctx.get("image_swapped") and ctx.get("old_image"):
+                _compose_set_image(_compose_image(), ctx["old_image"])
+                _compose("up", "-d", timeout=1800)
+                _wait_ready()
+            if ctx.get("db_backup") and DB_ROOT_PASSWORD:
+                _bench("--site", SITE, "restore", ctx["db_backup"],
+                       "--db-root-password", DB_ROOT_PASSWORD, "--force", timeout=3600)
+        except Exception as re:
+            log(f"rollback error: {re}")
+        try:
+            ev(kind="terminal", outcome="rolled_back", message=str(e)[:200])
+        except Exception:
+            pass
+
+
+# ── Blue/green sidecar self-update ─────────────────────────────────────────
+# The sidecar must NOT restart itself in-process (it is its own rollback executor — a crash on
+# broken new code leaves nothing to recover). Instead: download the SERVER-PINNED artifact,
+# verify its checksum, stage it, HEALTH-GATE it with `--selfcheck` in a child process, flip the
+# CURRENT symlink atomically (keeping the prior release), then let the OS supervisor restart us.
+
+
+def _find_entrypoint(root: str) -> str | None:
+    for base, _dirs, files in os.walk(root):
+        if "infinary_agent.py" in files:
+            return os.path.join(base, "infinary_agent.py")
+    return None
+
+
+def _atomic_symlink(target: str, link: str) -> None:
+    tmp = link + ".tmp"
+    if os.path.islink(tmp) or os.path.exists(tmp):
+        os.remove(tmp)
+    os.symlink(target, tmp)
+    os.replace(tmp, link)  # atomic on POSIX
+
+
+def run_agent_self_update(artifact: dict, jid: str, run_type: str) -> None:
+    version = str(artifact.get("version") or "")
+    url = artifact.get("url")
+    sha = artifact.get("sha256")
+
+    def ev(**e):
+        emit(jid, runType=run_type, **e)
+
+    try:
+        ev(kind="stage", stage="working", stageStatus="started", message=f"Updating the agent to {version}")
+        if DRYRUN:
+            time.sleep(1)
+            ev(kind="terminal", outcome="success", message=f"Agent updated to {version} (dry-run)")
+            return
+        if not SELF_UPDATE_DIR:
+            ev(kind="terminal", outcome="skipped", message="Skipped: INFINARY_SELF_UPDATE_DIR not configured")
+            return
+        if not (url and sha):
+            ev(kind="terminal", outcome="skipped", message="Skipped: no server-pinned artifact")
+            return
+        # download + verify checksum
+        tmp = tempfile.mkdtemp(prefix="infinary-agent-")
+        archive = os.path.join(tmp, "agent.tgz")
+        h = hashlib.sha256()
+        with S.get(url, stream=True, timeout=300) as resp:
+            resp.raise_for_status()
+            with open(archive, "wb") as f:
+                for chunk in resp.iter_content(65536):
+                    f.write(chunk)
+                    h.update(chunk)
+        if h.hexdigest() != sha:
+            ev(kind="terminal", outcome="blocked", message="Artifact checksum mismatch — refusing")
+            return
+        # stage the release
+        release = os.path.join(SELF_UPDATE_DIR, "releases", version)
+        if os.path.isdir(release):
+            shutil.rmtree(release)
+        os.makedirs(release, exist_ok=True)
+        shutil.unpack_archive(archive, release)
+        entry = _find_entrypoint(release)
+        if not entry:
+            ev(kind="terminal", outcome="blocked", message="Staged release missing infinary_agent.py")
+            return
+        # HEALTH GATE: run the staged binary in --selfcheck (imports + config) BEFORE flipping
+        chk = subprocess.run([sys.executable, entry, "--selfcheck"], capture_output=True, text=True, timeout=120)
+        if chk.returncode != 0:
+            ev(kind="terminal", outcome="blocked", message=f"Self-check failed: {(chk.stderr or chk.stdout)[:160]}")
+            return
+        # flip CURRENT atomically (the prior release stays for rollback), then hand off to the supervisor
+        _atomic_symlink(os.path.dirname(entry), os.path.join(SELF_UPDATE_DIR, "current"))
+        # Optimistic success: the self-check passed + the symlink is flipped. True confirmation is
+        # the NEXT healthy heartbeat on the new version (the control plane sees the version advance).
+        ev(kind="terminal", outcome="success", message=f"Updated to {version}; restarting")
+        log(f"self-update staged to {version}; requesting restart")
+        subprocess.Popen(SELF_UPDATE_RESTART)
+    except Exception as e:
+        log(f"self-update failed: {e}")
+        try:
+            ev(kind="terminal", outcome="blocked", message=str(e)[:200])
+        except Exception:
+            pass
+
+
+def _capture_desired(desired: dict) -> None:
+    """Stash desired-state from the heartbeat response so reporting + the engine can use it."""
+    global _latest_agent_version, _pending_updates, _agent_artifact
+    _latest_agent_version = desired.get("latestAgentVersion")
+    _pending_updates = desired.get("availableAppUpdates") or []
+    _agent_artifact = desired.get("agentArtifact")
+
+
+def _maybe_auto_update(desired: dict) -> None:
+    """At most one managed run per cycle (single-flight); the begin endpoint is the server-side guard."""
+    policy = desired.get("updatePolicy") or {}
+    enabled = bool(policy.get("enabled"))
+    updates = desired.get("availableAppUpdates") or []
+    security = [u for u in updates if u.get("security")]
+    regular = [u for u in updates if not u.get("security")]
+    scope = policy.get("scope", "both")
+
+    # 1) Always-on security patches (the covenant) — every managed plan, default window if no policy.
+    if desired.get("securityPatching") and security:
+        win_t = policy.get("time") if enabled else SECURITY_WINDOW
+        win_m = (policy.get("windowMinutes") if enabled else SECURITY_WINDOW_MIN) or SECURITY_WINDOW_MIN
+        win_tz = policy.get("timezone") if enabled else None
+        if _within_window(win_t, win_m, win_tz):
+            run_managed_update("security_patch", "security", security, scope)
+            return
+
+    if not enabled:
+        return
+    if not _within_window(policy.get("time", ""), policy.get("windowMinutes") or 60, policy.get("timezone")):
+        return
+
+    # 2) Scheduled app point updates (Safe Harbor+ window).
+    if scope in ("frappe_apps", "both") and regular:
+        run_managed_update("auto_update", "auto", regular, scope)
+        return
+
+    # 3) Scheduled agent self-update within the window (decision #5: agents update in the window).
+    if scope in ("agent", "both") and _agent_artifact and _agent_update_available():
+        jid = _begin_run("agent_update", "agent", f"sidecar {AGENT_VERSION} -> {_agent_artifact.get('version')}")
+        if jid:
+            run_agent_self_update(_agent_artifact, jid, "auto")
+
+
+def _self_check() -> int:
+    """Validate the staged release can run: imports already succeeded (we're executing), so just
+    confirm the required runtime env is present. Exit 0 = healthy → the caller flips the symlink."""
+    missing = [k for k in ("INFINARY_CONTROL_PLANE", "INFINARY_INSTANCE_ID", "INFINARY_AGENT_TOKEN") if not os.environ.get(k)]
+    if missing:
+        print(f"selfcheck FAILED: missing env {missing}", file=sys.stderr)
+        return 1
+    print(f"selfcheck OK: infinary-agent {AGENT_VERSION}")
+    return 0
+
+
 def main() -> None:
     if not DRYRUN and not SITE:
         raise SystemExit("INFINARY_SITE is required (or set INFINARY_DRYRUN=1)")
     log(f"{IID} -> {CP} every {PERIOD}s (outbound-only{', DRY-RUN' if DRYRUN else ''})")
     fails = 0
-    last_policy = None
     while True:
         try:
             desired = heartbeat()
+            _capture_desired(desired)
             if desired.get("paused"):
-                # Kill-switch: halt all job execution (a bad release / auto-update can be stopped
-                # fleet-wide from the control plane). We still heartbeat so liveness is preserved.
-                log("paused by control plane — skipping job polling this cycle")
+                # Kill-switch: halt ALL execution (jobs + auto-update) — a bad release can be
+                # stopped fleet-wide from the control plane. We still heartbeat so liveness holds.
+                log("paused by control plane — skipping jobs + auto-update this cycle")
             else:
-                # Phase 0: surface the auto-update schedule when it changes. The unattended
-                # auto-APPLY engine is not yet implemented — applying in-window is deferred.
-                policy = desired.get("updatePolicy")
-                if policy != last_policy:
-                    last_policy = policy
-                    if policy and policy.get("enabled"):
-                        log(f"auto-update window: daily {policy.get('time')} {policy.get('timezone')} "
-                            f"scope={policy.get('scope')} (auto-apply not yet active)")
+                # Pulled jobs first (major upgrade, actions, staff-forced agent update)…
                 for job in poll_jobs():
                     run_job(job)
+                # …then the in-window auto-update engine (security patches always-on; scheduled
+                # app + agent updates within the customer window). At most one managed run/cycle.
+                _maybe_auto_update(desired)
             fails = 0
         except Exception as e:
             # Never die: the control plane treats a stale (>24h) heartbeat as
@@ -455,4 +830,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if "--selfcheck" in sys.argv:
+        raise SystemExit(_self_check())
     main()
