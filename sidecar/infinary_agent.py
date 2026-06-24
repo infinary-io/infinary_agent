@@ -57,7 +57,7 @@ TARGET_IMAGE_ENV = os.environ.get("INFINARY_TARGET_IMAGE", "")
 DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
-AGENT_VERSION = "0.4.0"
+AGENT_VERSION = "0.5.0"
 # The Frappe-app version is read from the live site fingerprint; this is only the
 # dry-run fallback (kept in sync with infinary_agent/__init__.py for local demos).
 AGENT_APP_VERSION_DRYRUN = "0.3.2"
@@ -149,9 +149,15 @@ def collect_reported_state() -> dict:
     }
 
 
-def heartbeat() -> None:
+def heartbeat() -> dict:
     r = S.post(f"{CP}/v1/agent/{IID}/heartbeat", json=collect_reported_state(), timeout=30)
     r.raise_for_status()
+    # The control plane returns desired-state — the kill-switch (`paused`) and the customer's
+    # auto-update schedule (`updatePolicy`). Older control planes returned 204; decode defensively.
+    try:
+        return r.json() if r.content else {}
+    except Exception:
+        return {}
 
 
 def poll_jobs() -> list[dict]:
@@ -417,11 +423,25 @@ def main() -> None:
         raise SystemExit("INFINARY_SITE is required (or set INFINARY_DRYRUN=1)")
     log(f"{IID} -> {CP} every {PERIOD}s (outbound-only{', DRY-RUN' if DRYRUN else ''})")
     fails = 0
+    last_policy = None
     while True:
         try:
-            heartbeat()
-            for job in poll_jobs():
-                run_job(job)
+            desired = heartbeat()
+            if desired.get("paused"):
+                # Kill-switch: halt all job execution (a bad release / auto-update can be stopped
+                # fleet-wide from the control plane). We still heartbeat so liveness is preserved.
+                log("paused by control plane — skipping job polling this cycle")
+            else:
+                # Phase 0: surface the auto-update schedule when it changes. The unattended
+                # auto-APPLY engine is not yet implemented — applying in-window is deferred.
+                policy = desired.get("updatePolicy")
+                if policy != last_policy:
+                    last_policy = policy
+                    if policy and policy.get("enabled"):
+                        log(f"auto-update window: daily {policy.get('time')} {policy.get('timezone')} "
+                            f"scope={policy.get('scope')} (auto-apply not yet active)")
+                for job in poll_jobs():
+                    run_job(job)
             fails = 0
         except Exception as e:
             # Never die: the control plane treats a stale (>24h) heartbeat as
