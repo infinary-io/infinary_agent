@@ -57,7 +57,7 @@ TARGET_IMAGE_ENV = os.environ.get("INFINARY_TARGET_IMAGE", "")
 DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
-AGENT_VERSION = "0.3.1"
+AGENT_VERSION = "0.4.0"
 
 S = requests.Session()
 S.headers["Authorization"] = f"Bearer {TOKEN}"
@@ -126,12 +126,19 @@ def collect_reported_state() -> dict:
             },
             "lastUpdateOutcome": "none",
             "agentVersion": AGENT_VERSION,
+            "platform": {"python": "3.11.0", "mariadb": "11.8.0"},
+            "dataHealth": {"pendingPatches": 0, "failedPatches": 0},
+            "aiSpendCents": 0,
         }
     fp = _bench_json("infinary_agent.api.fingerprint")
     return {
         "versionVector": fp["versionVector"],
         "health": _health(),
         "drift": fp["drift"],
+        # platform / dataHealth / aiSpend are optional in the contract — pass through when present.
+        "platform": fp.get("platform"),
+        "dataHealth": fp.get("dataHealth"),
+        "aiSpendCents": fp.get("aiSpendCents", 0),
         "lastUpdateOutcome": fp.get("lastUpdateOutcome", "none"),
         "agentVersion": AGENT_VERSION,
     }

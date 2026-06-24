@@ -7,6 +7,7 @@ site's version vector + dual drift fingerprint. Nothing here listens on the
 network and nothing here writes: the app observes, the sidecar reports home.
 """
 import hashlib
+import sys
 from pathlib import Path
 
 import frappe
@@ -88,11 +89,53 @@ def _version_vector() -> dict:
     return vv
 
 
+def _platform() -> dict:
+    """Engine versions the control plane's `platform` gate checks against per-target floors."""
+    python = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    try:
+        mariadb = str(frappe.db.sql("SELECT VERSION()")[0][0]).split("-")[0]
+    except Exception:
+        mariadb = "unknown"
+    return {"python": python, "mariadb": mariadb}
+
+
+def _data_health() -> dict:
+    """Migration health the `data_health` gate reads: pending patches (in each app's
+    patches.txt but not yet in Patch Log) warn; failed patches block. Failed-patch
+    detection isn't first-class in Frappe, so it stays 0 until a migrate dry-run surfaces it."""
+    pending = 0
+    try:
+        applied = {r.patch for r in frappe.get_all("Patch Log", fields=["patch"])}
+        for app in frappe.get_installed_apps():
+            try:
+                txt = Path(frappe.get_app_path(app)).parent / "patches.txt"
+            except Exception:
+                continue
+            if not txt.exists():
+                continue
+            for line in txt.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("["):
+                    continue
+                if line not in applied:
+                    pending += 1
+    except Exception:
+        pending = 0
+    return {"pendingPatches": pending, "failedPatches": 0}
+
+
+def _ai_spend_cents() -> int:
+    """Action-mode AI spend this period (cents). 0 until the AI module accrues usage —
+    the field exists now so the control plane's metering reads a real value once it does."""
+    return 0
+
+
 @frappe.whitelist()
 def fingerprint() -> dict:
-    """Returns the version vector + the dual drift fingerprint. `bench execute`
-    serialises this dict to one line of JSON, which the sidecar parses; it is also
-    directly callable over Frappe's whitelisted-method API."""
+    """Returns the version vector + the dual drift fingerprint, plus the platform,
+    data-health and AI-spend signals the control plane's gates + billing read. `bench
+    execute` serialises this dict to one line of JSON, which the sidecar parses; it is
+    also directly callable over Frappe's whitelisted-method API."""
     fs_hash = _filesystem_hash()
     db_hash, detected = _db_customizations()
     # DB customizations are self-evident drift; filesystem drift is decided by the
@@ -112,5 +155,8 @@ def fingerprint() -> dict:
             "hasDrift": has_drift,
             "detected": detected,
         },
+        "platform": _platform(),
+        "dataHealth": _data_health(),
+        "aiSpendCents": _ai_spend_cents(),
         "lastUpdateOutcome": "none",
     }
