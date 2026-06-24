@@ -69,7 +69,8 @@ python sidecar/infinary_agent.py
 | `INFINARY_INSTANCE_ID` | — | from the provision response |
 | `INFINARY_AGENT_TOKEN` | — | per-instance bearer token (provision response) |
 | `INFINARY_SITE` | — | the Frappe site name (required unless dry-run) |
-| `INFINARY_BENCH` | `/home/frappe/frappe-bench` | bench path |
+| `INFINARY_BENCH` | `/home/frappe/frappe-bench` | bench path (used only when bench runs on the host) |
+| `INFINARY_BENCH_CMD` | `bench` | bench invocation; set to `docker compose exec -T backend bench` on a frappe_docker box (run the service from the compose dir) |
 | `INFINARY_HEARTBEAT_SEC` | `45` | loop cadence |
 | `INFINARY_DRYRUN` | — | `1` fakes the bench (heartbeat + upgrade) for local testing |
 | `INFINARY_DRYRUN_VERSION` | `15` | dry-run ERPNext version — a step behind LATEST so a dry-run demos an upgrade |

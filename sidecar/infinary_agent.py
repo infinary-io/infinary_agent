@@ -17,6 +17,8 @@ Env:
   INFINARY_AGENT_TOKEN     per-instance bearer token (from the provision response)
   INFINARY_SITE            the Frappe site name (required unless dry-run)
   INFINARY_BENCH           bench path (default /home/frappe/frappe-bench)
+  INFINARY_BENCH_CMD       bench invocation (default "bench"); set to e.g.
+                           "docker compose exec -T backend bench" for frappe_docker
   INFINARY_HEARTBEAT_SEC   loop cadence, default 45
   INFINARY_DRYRUN          "1" → fake the bench (heartbeat + upgrade) for testing
   INFINARY_DRYRUN_VERSION  dry-run ERPNext version (default "15" — a step behind LATEST so a dry-run demos an upgrade)
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import time
 
@@ -35,9 +38,12 @@ IID = os.environ["INFINARY_INSTANCE_ID"]
 TOKEN = os.environ["INFINARY_AGENT_TOKEN"]
 SITE = os.environ.get("INFINARY_SITE", "")
 BENCH = os.environ.get("INFINARY_BENCH", "/home/frappe/frappe-bench")
+# bench invocation — override for a containerised bench, e.g. on frappe_docker:
+#   INFINARY_BENCH_CMD="docker compose exec -T backend bench"  (run from the compose dir)
+BENCH_CMD = shlex.split(os.environ.get("INFINARY_BENCH_CMD", "bench"))
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.2.3"
 
 S = requests.Session()
 S.headers["Authorization"] = f"Bearer {TOKEN}"
@@ -52,9 +58,13 @@ def log(msg: str) -> None:
 
 
 def _bench(*args: str, timeout: int = 3600) -> str:
-    """Run a bench command in the bench dir; raise on non-zero."""
-    log("$ bench " + " ".join(args))
-    out = subprocess.run(["bench", *args], cwd=BENCH, capture_output=True, text=True, timeout=timeout)
+    """Run a bench command (raise on non-zero). INFINARY_BENCH_CMD lets bench live
+    behind a wrapper — e.g. `docker compose exec -T backend bench` on a frappe_docker
+    box, where bench runs inside the container rather than on the host."""
+    cmd = [*BENCH_CMD, *args]
+    log("$ " + " ".join(cmd))
+    cwd = BENCH if BENCH_CMD == ["bench"] else None
+    out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     if out.returncode != 0:
         raise RuntimeError(f"bench {args[0]} failed: {(out.stderr or out.stdout).strip()[:300]}")
     return out.stdout
