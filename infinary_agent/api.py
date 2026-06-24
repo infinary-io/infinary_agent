@@ -13,12 +13,13 @@ from pathlib import Path
 import frappe
 
 # UI-driven customizations a filesystem hash CANNOT see — the false-green source.
+# (User-created DocTypes are handled separately: there is no "Custom DocType"
+# doctype — they are DocType rows flagged custom=1.)
 DRIFT_DOCTYPES = [
     "Custom Field",
     "Property Setter",
     "Server Script",
     "Client Script",
-    "Custom DocType",
 ]
 
 # Apps that make up a clean Infinary instance. Anything else installed is itself
@@ -56,12 +57,19 @@ def _db_customizations() -> tuple[str, dict]:
         counts[dt] = len(rows)
         for r in rows:
             h.update(f"{dt}|{r['name']}|{r['modified']}".encode())
+    # User-created DocTypes are DocType rows flagged custom=1 (there is no
+    # "Custom DocType" doctype). Hash them under a stable label.
+    custom_dts = frappe.get_all(
+        "DocType", filters={"custom": 1}, fields=["name", "modified"], order_by="name"
+    )
+    for r in custom_dts:
+        h.update(f"Custom DocType|{r['name']}|{r['modified']}".encode())
     custom_apps = [a for a in frappe.get_installed_apps() if a not in BASELINE_APPS]
     detected = {
         "customFields": counts.get("Custom Field", 0),
         "serverScripts": counts.get("Server Script", 0),
         "clientScripts": counts.get("Client Script", 0),
-        "customDoctypes": counts.get("Custom DocType", 0),
+        "customDoctypes": len(custom_dts),
         "customApps": custom_apps,
     }
     return "sha256:" + h.hexdigest(), detected
