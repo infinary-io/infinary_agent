@@ -58,6 +58,9 @@ DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
 AGENT_VERSION = "0.4.0"
+# The Frappe-app version is read from the live site fingerprint; this is only the
+# dry-run fallback (kept in sync with infinary_agent/__init__.py for local demos).
+AGENT_APP_VERSION_DRYRUN = "0.3.2"
 
 S = requests.Session()
 S.headers["Authorization"] = f"Bearer {TOKEN}"
@@ -126,6 +129,7 @@ def collect_reported_state() -> dict:
             },
             "lastUpdateOutcome": "none",
             "agentVersion": AGENT_VERSION,
+            "agentAppVersion": AGENT_APP_VERSION_DRYRUN,
             "platform": {"python": "3.11.0", "mariadb": "11.8.0"},
             "dataHealth": {"pendingPatches": 0, "failedPatches": 0},
             "aiSpendCents": 0,
@@ -141,6 +145,7 @@ def collect_reported_state() -> dict:
         "aiSpendCents": fp.get("aiSpendCents", 0),
         "lastUpdateOutcome": fp.get("lastUpdateOutcome", "none"),
         "agentVersion": AGENT_VERSION,
+        "agentAppVersion": fp.get("agentAppVersion"),
     }
 
 
@@ -327,11 +332,8 @@ STAGES = [
 ]
 
 
-def run_job(job: dict) -> None:
+def run_upgrade(job: dict) -> None:
     jid = job["id"]
-    if job.get("type") != "major_upgrade":
-        emit(jid, kind="terminal", outcome="blocked", message=f"Unsupported job type: {job.get('type')}")
-        return
     payload = job.get("payload", {}) or {}
     to = str(payload.get("toVersion") or "")
     if DRYRUN:
@@ -359,6 +361,55 @@ def run_job(job: dict) -> None:
         except Exception as re:
             log(f"rollback error: {re}")
         emit(jid, kind="terminal", outcome="rolled_back", message=str(e)[:200])
+
+
+# ── Simple instance actions (backup / restart / clear-cache) ───────────────
+# These are jobs the control plane enqueues and the agent PULLS — same outbound-only
+# transport as upgrades. Each emits a single "working" stage + a terminal, tagged
+# runType="action" so the control plane records them in the action ledger (and they
+# never count toward upgrade gating).
+
+
+def _emit_action(jid: str, **event) -> None:
+    emit(jid, runType="action", **event)
+
+
+def _run_simple_action(job: dict, *, label: str, done: str, cmd: tuple[str, ...]) -> None:
+    jid = job["id"]
+    _emit_action(jid, kind="stage", stage="working", stageStatus="started", message=label)
+    try:
+        if not DRYRUN:
+            _bench(*cmd)
+        _emit_action(jid, kind="terminal", outcome="success", message=done)
+    except Exception as e:
+        log(f"action {job.get('type')} failed: {e}")
+        # No TerminalOutcome for plain failure; 'blocked' maps to the ledger's 'failed' status.
+        _emit_action(jid, kind="terminal", outcome="blocked", message=str(e)[:200])
+
+
+ACTION_HANDLERS = {
+    "backup": lambda job: _run_simple_action(
+        job, label="Taking a backup of your data", done="Backup complete",
+        cmd=("--site", SITE, "backup", "--with-files")),
+    "restart": lambda job: _run_simple_action(
+        job, label="Restarting your services", done="Services restarted", cmd=("restart",)),
+    "clear_cache": lambda job: _run_simple_action(
+        job, label="Clearing caches", done="Caches cleared",
+        cmd=("--site", SITE, "clear-cache")),
+}
+
+
+def run_job(job: dict) -> None:
+    """Dispatch a pulled job by type: the 5-stage major upgrade, or a simple action."""
+    jtype = job.get("type")
+    if jtype == "major_upgrade":
+        run_upgrade(job)
+        return
+    handler = ACTION_HANDLERS.get(jtype)
+    if handler is None:
+        _emit_action(job["id"], kind="terminal", outcome="blocked", message=f"Unsupported job type: {jtype}")
+        return
+    handler(job)
 
 
 def main() -> None:
