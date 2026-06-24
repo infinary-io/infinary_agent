@@ -1,3 +1,3 @@
 """Infinary Agent — the outbound site agent (version + drift fingerprint)."""
 
-__version__ = "0.2.2"
+__version__ = "0.3.2"
