@@ -572,8 +572,15 @@ def _capability_ready() -> tuple[bool, str]:
 
 
 def _point_image(updates: list[dict]) -> str:
-    """The single pinned image that realises these point updates (bounded — same-major)."""
-    erp = next((u for u in updates if u.get("name") == "erpnext"), updates[0])
+    """The single pinned image that realises these point updates. The image is ERPNext-keyed, so
+    an `erpnext` update MUST be present, and all targets must share one major (the control plane
+    guarantees same-major, but we assert it here too — a major jump is the gated upgrade path)."""
+    erp = next((u for u in updates if u.get("name") == "erpnext"), None)
+    if erp is None:
+        raise RuntimeError("image-swap auto-update requires an erpnext point release (other apps go via app_update)")
+    majors = {str(u["availableVersion"]).split(".")[0] for u in updates}
+    if len(majors) != 1:
+        raise RuntimeError(f"refusing mixed-major point update: {sorted(majors)}")
     version = str(erp["availableVersion"])
     return POINT_IMAGE_TEMPLATE.format(version=version, major=version.split(".")[0])
 
@@ -604,6 +611,14 @@ def run_managed_update(kind: str, run_type: str, updates: list[dict], scope: str
             _dry_version = str(updates[-1]["availableVersion"])
             ev(kind="terminal", outcome="success", message=f"Applied {summary}")
             return
+        # Resolve the pinned target image up front — if this set isn't realisable as an image swap
+        # (no erpnext point release, or mixed majors), skip cleanly WITHOUT taking a snapshot.
+        try:
+            target = _point_image(updates)
+        except RuntimeError as ie:
+            log(f"managed update not applicable as an image swap: {ie}")
+            ev(kind="terminal", outcome="skipped", message=f"Skipped: {ie}")
+            return
         # 1) snapshot — the rollback source (fail-closed if we can't capture a restorable dump)
         ev(kind="stage", stage="backing_up", stageStatus="started", message="Taking a snapshot first")
         ctx["old_image"] = _compose_image()
@@ -620,7 +635,6 @@ def run_managed_update(kind: str, run_type: str, updates: list[dict], scope: str
             return
         ev(kind="stage", stage="backing_up", stageStatus="completed")
         # 2) apply via a PINNED image swap (bounded; never an unbounded `bench update --pull`)
-        target = _point_image(updates)
         ev(kind="stage", stage="installing", stageStatus="started", message=f"Applying {summary}")
         try:
             _run(["docker", "image", "inspect", target], timeout=60)
@@ -632,6 +646,7 @@ def run_managed_update(kind: str, run_type: str, updates: list[dict], scope: str
         _wait_ready()
         ev(kind="stage", stage="installing", stageStatus="completed")
         ev(kind="stage", stage="migrating", stageStatus="started", message="Applying to your records")
+        ctx["migrated"] = True  # from here a failure means the schema may be partly migrated
         _bench("--site", SITE, "migrate")
         ev(kind="stage", stage="migrating", stageStatus="completed")
         # 3) verify
@@ -642,20 +657,45 @@ def run_managed_update(kind: str, run_type: str, updates: list[dict], scope: str
         log(f"managed update applied: {summary}")
     except Exception as e:
         log(f"managed update failed, rolling back: {e}")
-        try:
-            if ctx.get("image_swapped") and ctx.get("old_image"):
-                _compose_set_image(_compose_image(), ctx["old_image"])
+        db = ctx.get("db_backup")
+        migrated = ctx.get("migrated")
+        old = ctx.get("old_image") if ctx.get("image_swapped") else None
+
+        def _revert_image():
+            if old:
+                _compose_set_image(_compose_image(), old)
                 _compose("up", "-d", timeout=1800)
                 _wait_ready()
-            if ctx.get("db_backup") and DB_ROOT_PASSWORD:
-                _bench("--site", SITE, "restore", ctx["db_backup"],
-                       "--db-root-password", DB_ROOT_PASSWORD, "--force", timeout=3600)
+
+        try:
+            if migrated:
+                # The schema may be partly migrated. COVENANT: never downgrade code against a
+                # migrated DB. Restore the snapshot FIRST (the safe direction), then revert the
+                # image. If the restore fails we must NOT revert the code — leave the new image up
+                # and fail loudly for manual recovery.
+                if not (db and DB_ROOT_PASSWORD):
+                    log("CANNOT roll back safely: migration ran but no restorable snapshot — leaving new image up")
+                    ev(kind="terminal", outcome="failed",
+                       message="Update failed mid-migration with no restorable snapshot — left on the new version; manual recovery needed")
+                    return
+                try:
+                    _bench("--site", SITE, "restore", db, "--db-root-password", DB_ROOT_PASSWORD, "--force", timeout=3600)
+                except Exception as re:
+                    log(f"DB restore FAILED during rollback: {re} — leaving new image up (refusing to downgrade code onto a migrated DB)")
+                    ev(kind="terminal", outcome="failed",
+                       message="Update failed and the snapshot could not be restored — left on the new version; manual recovery needed")
+                    return
+                _revert_image()
+            else:
+                # Migration never ran → schema untouched → safe to just revert the image.
+                _revert_image()
+            ev(kind="terminal", outcome="rolled_back", message=str(e)[:200])
         except Exception as re:
             log(f"rollback error: {re}")
-        try:
-            ev(kind="terminal", outcome="rolled_back", message=str(e)[:200])
-        except Exception:
-            pass
+            try:
+                ev(kind="terminal", outcome="failed", message=f"Rollback error: {str(re)[:160]}")
+            except Exception:
+                pass
 
 
 # ── Blue/green sidecar self-update ─────────────────────────────────────────
@@ -680,6 +720,55 @@ def _atomic_symlink(target: str, link: str) -> None:
     os.replace(tmp, link)  # atomic on POSIX
 
 
+def _su_path(name: str) -> str:
+    return os.path.join(SELF_UPDATE_DIR, name)
+
+
+def _self_update_boot_guard() -> None:
+    """Crash-loop recovery: if the current release keeps restarting WITHOUT ever reaching a healthy
+    heartbeat, revert the `current` symlink to the previous release and exit so the supervisor
+    restarts into the known-good code. A normal release clears the counter on its first heartbeat."""
+    if not SELF_UPDATE_DIR:
+        return
+    healthy = _su_path(".healthy")
+    if os.path.exists(healthy):
+        return  # the running release already proved itself
+    previous, attempts_file = _su_path("previous"), _su_path(".boot_attempts")
+    try:
+        n = int(open(attempts_file).read().strip()) if os.path.exists(attempts_file) else 0
+    except Exception:
+        n = 0
+    n += 1
+    try:
+        with open(attempts_file, "w") as f:
+            f.write(str(n))
+    except Exception:
+        return
+    if n >= 3 and os.path.islink(previous):
+        target = os.path.realpath(previous)
+        log(f"SELF-UPDATE CRASH-LOOP: {n} boots without a healthy heartbeat — reverting to {target}; exiting for supervisor restart")
+        try:
+            _atomic_symlink(target, _su_path("current"))
+            os.remove(attempts_file)
+        except Exception as e:
+            log(f"crash-loop revert failed: {e}")
+        raise SystemExit(1)
+
+
+def _mark_self_update_healthy() -> None:
+    """Called after the first successful heartbeat — the running release is confirmed good."""
+    if not SELF_UPDATE_DIR:
+        return
+    try:
+        with open(_su_path(".healthy"), "w") as f:
+            f.write(AGENT_VERSION)
+        ap = _su_path(".boot_attempts")
+        if os.path.exists(ap):
+            os.remove(ap)
+    except Exception:
+        pass
+
+
 def run_agent_self_update(artifact: dict, jid: str, run_type: str) -> None:
     version = str(artifact.get("version") or "")
     url = artifact.get("url")
@@ -688,6 +777,7 @@ def run_agent_self_update(artifact: dict, jid: str, run_type: str) -> None:
     def ev(**e):
         emit(jid, runType=run_type, **e)
 
+    staging = ""
     try:
         ev(kind="stage", stage="working", stageStatus="started", message=f"Updating the agent to {version}")
         if DRYRUN:
@@ -713,34 +803,59 @@ def run_agent_self_update(artifact: dict, jid: str, run_type: str) -> None:
         if h.hexdigest() != sha:
             ev(kind="terminal", outcome="blocked", message="Artifact checksum mismatch — refusing")
             return
-        # stage the release
-        release = os.path.join(SELF_UPDATE_DIR, "releases", version)
-        if os.path.isdir(release):
-            shutil.rmtree(release)
-        os.makedirs(release, exist_ok=True)
-        shutil.unpack_archive(archive, release)
-        entry = _find_entrypoint(release)
-        if not entry:
+        # Unpack + validate in a STAGING dir on the SAME filesystem (so the publish is an atomic
+        # rename), so a partial/corrupt unpack never pollutes releases/<version>.
+        os.makedirs(os.path.join(SELF_UPDATE_DIR, "releases"), exist_ok=True)
+        staging = _su_path(f".staging-{version}")
+        if os.path.isdir(staging):
+            shutil.rmtree(staging)
+        os.makedirs(staging)
+        shutil.unpack_archive(archive, staging)
+        staged_entry = _find_entrypoint(staging)
+        if not staged_entry:
             ev(kind="terminal", outcome="blocked", message="Staged release missing infinary_agent.py")
             return
-        # HEALTH GATE: run the staged binary in --selfcheck (imports + config) BEFORE flipping
-        chk = subprocess.run([sys.executable, entry, "--selfcheck"], capture_output=True, text=True, timeout=120)
+        # HEALTH GATE: run the staged binary in --selfcheck (imports + config) BEFORE publishing
+        chk = subprocess.run([sys.executable, staged_entry, "--selfcheck"], capture_output=True, text=True, timeout=120)
         if chk.returncode != 0:
             ev(kind="terminal", outcome="blocked", message=f"Self-check failed: {(chk.stderr or chk.stdout)[:160]}")
             return
-        # flip CURRENT atomically (the prior release stays for rollback), then hand off to the supervisor
-        _atomic_symlink(os.path.dirname(entry), os.path.join(SELF_UPDATE_DIR, "current"))
-        # Optimistic success: the self-check passed + the symlink is flipped. True confirmation is
-        # the NEXT healthy heartbeat on the new version (the control plane sees the version advance).
-        ev(kind="terminal", outcome="success", message=f"Updated to {version}; restarting")
+        # Atomically publish the validated release (rename within the same FS).
+        release = _su_path(os.path.join("releases", version))
+        if os.path.isdir(release):
+            shutil.rmtree(release)
+        os.replace(os.path.dirname(staged_entry), release)
+        release_entry = _find_entrypoint(release) or os.path.join(release, "infinary_agent.py")
+        # Record the OUTGOING release for crash-loop revert, and require the new one to re-prove
+        # health (clear the markers) BEFORE flipping `current`.
+        cur_link = _su_path("current")
+        if os.path.islink(cur_link):
+            _atomic_symlink(os.path.realpath(cur_link), _su_path("previous"))
+        for marker in (".healthy", ".boot_attempts"):
+            p = _su_path(marker)
+            if os.path.exists(p):
+                os.remove(p)
+        _atomic_symlink(os.path.dirname(release_entry), cur_link)
         log(f"self-update staged to {version}; requesting restart")
-        subprocess.Popen(SELF_UPDATE_RESTART)
+        # Hand the restart to the OS supervisor. Only claim success once the launch itself
+        # succeeds (a failed launch → 'blocked', not a false 'success'). If the new code is
+        # broken at runtime, the boot-guard reverts after repeated crashes + the next healthy
+        # heartbeat is the true confirmation.
+        try:
+            subprocess.Popen(SELF_UPDATE_RESTART)
+        except Exception as re:
+            ev(kind="terminal", outcome="blocked", message=f"Restart launch failed: {str(re)[:160]}")
+            return
+        ev(kind="terminal", outcome="success", message=f"Updated to {version}; restarting")
     except Exception as e:
         log(f"self-update failed: {e}")
         try:
             ev(kind="terminal", outcome="blocked", message=str(e)[:200])
         except Exception:
             pass
+    finally:
+        if staging and os.path.isdir(staging):
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def _capture_desired(desired: dict) -> None:
@@ -800,11 +915,16 @@ def _self_check() -> int:
 def main() -> None:
     if not DRYRUN and not SITE:
         raise SystemExit("INFINARY_SITE is required (or set INFINARY_DRYRUN=1)")
+    _self_update_boot_guard()  # crash-loop recovery before we do anything else
     log(f"{IID} -> {CP} every {PERIOD}s (outbound-only{', DRY-RUN' if DRYRUN else ''})")
     fails = 0
+    healthy_marked = False
     while True:
         try:
             desired = heartbeat()
+            if not healthy_marked:
+                _mark_self_update_healthy()  # first successful heartbeat → this release is good
+                healthy_marked = True
             _capture_desired(desired)
             if desired.get("paused"):
                 # Kill-switch: halt ALL execution (jobs + auto-update) — a bad release can be
@@ -812,11 +932,15 @@ def main() -> None:
                 log("paused by control plane — skipping jobs + auto-update this cycle")
             else:
                 # Pulled jobs first (major upgrade, actions, staff-forced agent update)…
-                for job in poll_jobs():
+                jobs = poll_jobs()
+                for job in jobs:
                     run_job(job)
-                # …then the in-window auto-update engine (security patches always-on; scheduled
-                # app + agent updates within the customer window). At most one managed run/cycle.
-                _maybe_auto_update(desired)
+                # …then the in-window auto-update engine — but ONLY in a cycle with no pulled jobs,
+                # so a scheduled update never runs in the same cycle as a major upgrade / action
+                # (explicit serialization on top of the control plane's single-flight lock). At
+                # most one managed run per idle cycle.
+                if not jobs:
+                    _maybe_auto_update(desired)
             fails = 0
         except Exception as e:
             # Never die: the control plane treats a stale (>24h) heartbeat as
