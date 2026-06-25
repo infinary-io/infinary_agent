@@ -28,10 +28,11 @@ Env:
   INFINARY_COMPOSE_SERVICE compose driver: the frappe service name (default backend)
   INFINARY_DB_ROOT_PASSWORD  compose driver: DB root password for restore-on-rollback
 
-  Auto-update engine (scheduled point updates + always-on security patches):
-  INFINARY_POINT_IMAGE_TEMPLATE  pinned image for a point update, {version}/{major} expand
-                                 (e.g. "infinary/erpnext-fac:v{major}-{version}"); unset ⇒
-                                 point auto-update is disabled (fail-closed)
+  Auto-update engine (image-targeted point updates + always-on security patches):
+  (the target image is curated control-plane-side via APPROVED_FAC_IMAGE and delivered as
+   `approvedImage` on the heartbeat; the agent swaps the compose image to it when it differs.
+   Requires INFINARY_UPGRADE_DRIVER=compose + INFINARY_DB_ROOT_PASSWORD for the fail-closed probe.)
+  INFINARY_DRYRUN_IMAGE          dry-run: the fake "current image" reported (default v16-2.6.2)
   INFINARY_SECURITY_WINDOW       default daily window for always-on security patches (HH:MM, default 01:00)
   INFINARY_SECURITY_WINDOW_MIN   security window length in minutes (default 180)
   INFINARY_FORCE_WINDOW          "1" → ignore the clock window (testing only)
@@ -82,17 +83,16 @@ TARGET_IMAGE_ENV = os.environ.get("INFINARY_TARGET_IMAGE", "")
 DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
-AGENT_VERSION = "0.6.0"
+AGENT_VERSION = "0.7.0"
 # The Frappe-app version is read from the live site fingerprint; this is only the
 # dry-run fallback (kept in sync with infinary_agent/__init__.py for local demos).
 AGENT_APP_VERSION_DRYRUN = "0.3.2"
 
 # ── Auto-update engine config ─────────────────────────────────────────────
-# Point updates apply via a PINNED image swap (compose) — the agent never runs an
-# unbounded `bench update --pull`. The template turns an approved version into the exact
-# image tag; unset ⇒ point auto-update can't run (fail-closed). {version}/{major} expand.
-POINT_IMAGE_TEMPLATE = os.environ.get("INFINARY_POINT_IMAGE_TEMPLATE", "")
-# Security patches are always-on (the covenant). Absent a customer window they apply inside
+# Point updates apply via a PINNED image swap (compose) — the agent never runs an unbounded
+# `bench update --pull`. The TARGET image is curated by the control plane (APPROVED_FAC_IMAGE,
+# delivered as `approvedImage` on the heartbeat); the agent swaps to it when it differs from the
+# running image. Security patches are always-on (the covenant). Absent a customer window they apply inside
 # this conservative default daily window (instance-local time).
 SECURITY_WINDOW = os.environ.get("INFINARY_SECURITY_WINDOW", "01:00")
 SECURITY_WINDOW_MIN = int(os.environ.get("INFINARY_SECURITY_WINDOW_MIN", "180"))
@@ -108,12 +108,26 @@ S.headers["Authorization"] = f"Bearer {TOKEN}"
 # In dry-run the agent keeps an in-process version so a successful upgrade visibly
 # bumps what subsequent heartbeats report.
 _dry_version = os.environ.get("INFINARY_DRYRUN_VERSION", "15")
+_dry_image = os.environ.get("INFINARY_DRYRUN_IMAGE", "infinary/erpnext-fac:v16-2.6.2")
 
 # Desired-state captured from the most recent heartbeat response, so collect_reported_state()
 # can compute availableAgentVersion + echo pending updates for portal visibility.
 _latest_agent_version: str | None = None
 _pending_updates: list[dict] = []
 _agent_artifact: dict | None = None
+_approved_image: str | None = None  # the control-plane-curated target container image (compose/fac)
+
+
+def _current_image_safe() -> str | None:
+    """The running compose image, or None if not a compose box / can't determine it."""
+    if DRYRUN:
+        return _dry_image
+    if UPGRADE_DRIVER != "compose":
+        return None
+    try:
+        return _compose_image()
+    except Exception:
+        return None
 
 
 def log(msg: str) -> None:
@@ -206,6 +220,7 @@ def collect_reported_state() -> dict:
             "aiSpendCents": 0,
             "availableAppUpdates": list(_pending_updates),
             "availableAgentVersion": _agent_update_available(),
+            "currentImage": _current_image_safe(),
         }
     fp = _bench_json("infinary_agent.api.fingerprint")
     return {
@@ -222,6 +237,7 @@ def collect_reported_state() -> dict:
         # Echo the control-plane-curated pending updates (visibility) + the self-update signal.
         "availableAppUpdates": list(_pending_updates),
         "availableAgentVersion": _agent_update_available(),
+        "currentImage": _current_image_safe(),
     }
 
 
@@ -497,17 +513,16 @@ def run_job(job: dict) -> None:
             _emit_action(job["id"], kind="terminal", outcome="skipped", message="No server-pinned agent artifact configured")
         return
     if jtype in ("update_now", "app_update"):
-        # Apply the control-plane-CURATED same-major point updates via the same snapshot+rollback
-        # core as the scheduled engine. update_now = all pending (or the requested subset /
-        # security-only); app_update = the named apps. Empty curated list ⇒ "already up to date".
-        payload = job.get("payload", {}) or {}
-        wanted = set(payload.get("apps") or [])
-        updates = list(_pending_updates)
-        if wanted:
-            updates = [u for u in updates if u.get("name") in wanted]
-        if payload.get("securityOnly"):
-            updates = [u for u in updates if u.get("security")]
-        _apply_point_updates(job["id"], "action", updates)
+        # Image-targeted: swap the compose image to the control-plane-CURATED target
+        # (APPROVED_FAC_IMAGE, delivered as `approvedImage` on the heartbeat), under snapshot +
+        # rollback. No approved image ⇒ nothing to apply; already on it ⇒ no-op success.
+        if not _approved_image:
+            _emit_action(job["id"], kind="terminal", outcome="skipped", message="No approved image configured (set APPROVED_FAC_IMAGE)")
+            return
+        if _current_image_safe() == _approved_image:
+            _emit_action(job["id"], kind="terminal", outcome="success", message="Already on the approved image")
+            return
+        _apply_image(job["id"], "action", _approved_image)
         return
     if jtype == "app_install":
         # Installing a NEW app means a rebuilt image on the compose/image topology — not something
@@ -582,47 +597,28 @@ def _capability_ready() -> tuple[bool, str]:
     if DRYRUN:
         return True, ""
     if UPGRADE_DRIVER != "compose":
-        return False, "point auto-update requires the compose driver"
-    if not POINT_IMAGE_TEMPLATE:
-        return False, "INFINARY_POINT_IMAGE_TEMPLATE not set (no pinned image target)"
+        return False, "image-targeted update requires the compose driver (set INFINARY_UPGRADE_DRIVER=compose)"
     if not DB_ROOT_PASSWORD:
         return False, "INFINARY_DB_ROOT_PASSWORD not set (cannot restore on rollback)"
     return True, ""
 
 
-def _point_image(updates: list[dict]) -> str:
-    """The single pinned image that realises these point updates. The image is ERPNext-keyed, so
-    an `erpnext` update MUST be present, and all targets must share one major (the control plane
-    guarantees same-major, but we assert it here too — a major jump is the gated upgrade path)."""
-    erp = next((u for u in updates if u.get("name") == "erpnext"), None)
-    if erp is None:
-        raise RuntimeError("image-swap auto-update requires an erpnext point release (other apps go via app_update)")
-    majors = {str(u["availableVersion"]).split(".")[0] for u in updates}
-    if len(majors) != 1:
-        raise RuntimeError(f"refusing mixed-major point update: {sorted(majors)}")
-    version = str(erp["availableVersion"])
-    return POINT_IMAGE_TEMPLATE.format(version=version, major=version.split(".")[0])
-
-
-def run_managed_update(kind: str, run_type: str, updates: list[dict], scope: str | None) -> None:
+def run_managed_update(kind: str, run_type: str, target_image: str, scope: str | None) -> None:
     """Agent-INITIATED run: announce it (the control plane re-checks paused / plan / single-flight +
-    opens a durable ledger record), then apply on the returned jobId."""
-    if not updates:
+    opens a durable ledger record), then apply the curated target image on the returned jobId."""
+    if not target_image:
         return
-    summary = ", ".join(f"{u['name']} {u['currentVersion']}->{u['availableVersion']}" for u in updates)
-    jid = _begin_run(kind, scope, summary[:480])
+    jid = _begin_run(kind, scope, f"image → {target_image}"[:480])
     if not jid:
         return  # refused (paused / single-flight / plan) — retry next cycle
-    _apply_point_updates(jid, run_type, updates)
+    _apply_image(jid, run_type, target_image)
 
 
-def _apply_point_updates(jid: str, run_type: str, updates: list[dict]) -> None:
-    """Snapshot → pinned-image apply → migrate → verify, rolling back on any failure. The jobId is
-    already open — via /begin (auto/security) OR a pulled update_now / app_update job."""
-    if not updates:
-        emit(jid, runType=run_type, kind="terminal", outcome="success", message="Already up to date")
-        return
-    summary = ", ".join(f"{u['name']} {u['currentVersion']}->{u['availableVersion']}" for u in updates)
+def _apply_image(jid: str, run_type: str, target_image: str) -> None:
+    """Snapshot → swap the compose image to `target_image` → migrate → verify, rolling back on any
+    failure. The jobId is already open — via /begin (auto/security) OR a pulled update_now job.
+    The target is the control-plane-curated image (APPROVED_FAC_IMAGE), not a version template."""
+    summary = f"→ {target_image}"
 
     def ev(**e):
         emit(jid, runType=run_type, **e)
@@ -637,21 +633,16 @@ def _apply_point_updates(jid: str, run_type: str, updates: list[dict]) -> None:
             return
         if DRYRUN:
             time.sleep(2)
-            global _dry_version
-            _dry_version = str(updates[-1]["availableVersion"])
-            ev(kind="terminal", outcome="success", message=f"Applied {summary}")
-            return
-        # Resolve the pinned target image up front — if this set isn't realisable as an image swap
-        # (no erpnext point release, or mixed majors), skip cleanly WITHOUT taking a snapshot.
-        try:
-            target = _point_image(updates)
-        except RuntimeError as ie:
-            log(f"managed update not applicable as an image swap: {ie}")
-            ev(kind="terminal", outcome="skipped", message=f"Skipped: {ie}")
+            global _dry_image
+            _dry_image = target_image
+            ev(kind="terminal", outcome="success", message=f"Applied image {target_image}")
             return
         # 1) snapshot — the rollback source (fail-closed if we can't capture a restorable dump)
         ev(kind="stage", stage="backing_up", stageStatus="started", message="Taking a snapshot first")
         ctx["old_image"] = _compose_image()
+        if ctx["old_image"] == target_image:
+            ev(kind="terminal", outcome="success", message="Already on the target image")
+            return
         _bench("--site", SITE, "backup", "--with-files")
         try:
             out = _compose("exec", "-T", COMPOSE_SERVICE, "bash", "-lc",
@@ -664,7 +655,8 @@ def _apply_point_updates(jid: str, run_type: str, updates: list[dict]) -> None:
             ev(kind="terminal", outcome="skipped", message="Skipped: could not capture a restorable backup")
             return
         ev(kind="stage", stage="backing_up", stageStatus="completed")
-        # 2) apply via a PINNED image swap (bounded; never an unbounded `bench update --pull`)
+        # 2) apply: swap the compose image to the curated target (bounded — a specific pinned image)
+        target = target_image
         ev(kind="stage", stage="installing", stageStatus="started", message=f"Applying {summary}")
         try:
             _run(["docker", "image", "inspect", target], timeout=60)
@@ -890,45 +882,39 @@ def run_agent_self_update(artifact: dict, jid: str, run_type: str) -> None:
 
 def _capture_desired(desired: dict) -> None:
     """Stash desired-state from the heartbeat response so reporting + the engine can use it."""
-    global _latest_agent_version, _pending_updates, _agent_artifact
+    global _latest_agent_version, _pending_updates, _agent_artifact, _approved_image
     _latest_agent_version = desired.get("latestAgentVersion")
     _pending_updates = desired.get("availableAppUpdates") or []
     _agent_artifact = desired.get("agentArtifact")
+    _approved_image = desired.get("approvedImage")
 
 
 def _maybe_auto_update(desired: dict) -> None:
-    """At most one managed run per cycle (single-flight); the begin endpoint is the server-side guard."""
+    """At most one managed run per cycle (single-flight; the begin endpoint is the server-side guard).
+    Image-targeted: swap to the control-plane-curated image when it differs from the running one."""
     policy = desired.get("updatePolicy") or {}
     enabled = bool(policy.get("enabled"))
-    updates = desired.get("availableAppUpdates") or []
-    security = [u for u in updates if u.get("security")]
-    regular = [u for u in updates if not u.get("security")]
     scope = policy.get("scope", "both")
 
-    # 1) Always-on security patches (the covenant) — every managed plan, default window if no policy.
-    if desired.get("securityPatching") and security:
-        win_t = policy.get("time") if enabled else SECURITY_WINDOW
-        win_m = (policy.get("windowMinutes") if enabled else SECURITY_WINDOW_MIN) or SECURITY_WINDOW_MIN
-        win_tz = policy.get("timezone") if enabled else None
-        if _within_window(win_t, win_m, win_tz):
-            run_managed_update("security_patch", "security", security, scope)
-            return
+    # 1) Image point update (apps) — apply the curated image when it differs from ours.
+    if _approved_image and scope in ("frappe_apps", "both"):
+        cur = _current_image_safe()
+        if cur and cur != _approved_image:
+            # Customer's window if scheduled auto-update is on; else the always-on security window
+            # (the covenant — a curated image is how we ship fixes on this topology).
+            if enabled and _within_window(policy.get("time", ""), policy.get("windowMinutes") or 60, policy.get("timezone")):
+                run_managed_update("auto_update", "auto", _approved_image, scope)
+                return
+            if desired.get("securityPatching") and _within_window(SECURITY_WINDOW, SECURITY_WINDOW_MIN, None):
+                run_managed_update("security_patch", "security", _approved_image, scope)
+                return
 
-    if not enabled:
-        return
-    if not _within_window(policy.get("time", ""), policy.get("windowMinutes") or 60, policy.get("timezone")):
-        return
-
-    # 2) Scheduled app point updates (Safe Harbor+ window).
-    if scope in ("frappe_apps", "both") and regular:
-        run_managed_update("auto_update", "auto", regular, scope)
-        return
-
-    # 3) Scheduled agent self-update within the window (decision #5: agents update in the window).
-    if scope in ("agent", "both") and _agent_artifact and _agent_update_available():
-        jid = _begin_run("agent_update", "agent", f"sidecar {AGENT_VERSION} -> {_agent_artifact.get('version')}")
-        if jid:
-            run_agent_self_update(_agent_artifact, jid, "auto")
+    # 2) Scheduled agent self-update within the customer window (decision #5: agents update in-window).
+    if enabled and scope in ("agent", "both") and _agent_artifact and _agent_update_available():
+        if _within_window(policy.get("time", ""), policy.get("windowMinutes") or 60, policy.get("timezone")):
+            jid = _begin_run("agent_update", "agent", f"sidecar {AGENT_VERSION} -> {_agent_artifact.get('version')}")
+            if jid:
+                run_agent_self_update(_agent_artifact, jid, "auto")
 
 
 def _self_check() -> int:
