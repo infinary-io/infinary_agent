@@ -83,7 +83,7 @@ TARGET_IMAGE_ENV = os.environ.get("INFINARY_TARGET_IMAGE", "")
 DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
-AGENT_VERSION = "0.7.0"
+AGENT_VERSION = "0.7.1"
 # The Frappe-app version is read from the live site fingerprint; this is only the
 # dry-run fallback (kept in sync with infinary_agent/__init__.py for local demos).
 AGENT_APP_VERSION_DRYRUN = "0.3.2"
@@ -362,8 +362,11 @@ class ComposeDriver(_Driver):
         ctx["old_image"] = _compose_image()
         _bench("--site", SITE, "backup", "--with-files")
         try:
+            # Newest DB dump. The inner `*` is REQUIRED: sites with backup encryption write
+            # `<ts>-<site>-database-enc.sql.gz`, so a bare `*-database.sql.gz` finds nothing and we'd
+            # wrongly bail "no restorable backup" (bench auto-decrypts the -enc dump on restore).
             out = _compose("exec", "-T", COMPOSE_SERVICE, "bash", "-lc",
-                           f"ls -t sites/{SITE}/private/backups/*-database.sql.gz | head -1",
+                           f"ls -t sites/{SITE}/private/backups/*-database*.sql.gz | head -1",
                            timeout=120)
             ctx["db_backup"] = out.strip() or None
         except Exception as e:
@@ -646,7 +649,7 @@ def _apply_image(jid: str, run_type: str, target_image: str) -> None:
         _bench("--site", SITE, "backup", "--with-files")
         try:
             out = _compose("exec", "-T", COMPOSE_SERVICE, "bash", "-lc",
-                           f"ls -t sites/{SITE}/private/backups/*-database.sql.gz | head -1", timeout=120)
+                           f"ls -t sites/{SITE}/private/backups/*-database*.sql.gz | head -1", timeout=120)
             ctx["db_backup"] = out.strip() or None
         except Exception as e:
             ctx["db_backup"] = None
