@@ -83,7 +83,7 @@ TARGET_IMAGE_ENV = os.environ.get("INFINARY_TARGET_IMAGE", "")
 DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
-AGENT_VERSION = "0.7.1"
+AGENT_VERSION = "0.7.2"
 # The Frappe-app version is read from the live site fingerprint; this is only the
 # dry-run fallback (kept in sync with infinary_agent/__init__.py for local demos).
 AGENT_APP_VERSION_DRYRUN = "0.3.2"
@@ -571,7 +571,9 @@ def _within_window(time_str: str, window_min: int, tz_name: str | None) -> bool:
     return 0 <= minutes_since < max(1, window_min)
 
 
-def _wait_ready(tries: int = 30) -> None:
+def _wait_ready(tries: int = 60) -> None:
+    # ~5 min budget: a freshly-pulled image's FIRST boot (asset check, cold caches) is much slower
+    # than a warm recreate — too small a budget turns a viable upgrade into a spurious abort.
     for _ in range(tries):
         try:
             _bench("--site", SITE, "execute", "frappe.ping", timeout=30)
@@ -668,15 +670,23 @@ def _apply_image(jid: str, run_type: str, target_image: str) -> None:
         _compose_set_image(ctx["old_image"], target)
         ctx["image_swapped"] = True
         _compose("up", "-d", timeout=1800)
-        _wait_ready()
+        _wait_ready()  # generous budget — a freshly-pulled image's first boot is slow
         ev(kind="stage", stage="installing", stageStatus="completed")
+        # Hold writes for the duration of migrate: anything a user writes now would be LOST if we
+        # roll back to the pre-migrate snapshot. maintenance_mode lives in site_config (a file), not
+        # the DB, so a DB restore won't clear it — the `finally` below guarantees it's turned off.
+        _bench("--site", SITE, "set-maintenance-mode", "on")
+        ctx["maint"] = True
         ev(kind="stage", stage="migrating", stageStatus="started", message="Applying to your records")
         ctx["migrated"] = True  # from here a failure means the schema may be partly migrated
         _bench("--site", SITE, "migrate")
         ev(kind="stage", stage="migrating", stageStatus="completed")
-        # 3) verify
+        # 3) verify — RETRY, not a single ping: a transient post-migrate/cold-boot hiccup must not
+        # trigger a needless destructive rollback of a migration that actually succeeded.
         ev(kind="stage", stage="final_checks", stageStatus="started", message="Running smoke checks")
-        _bench("--site", SITE, "execute", "frappe.ping", timeout=120)
+        _wait_ready()
+        _bench("--site", SITE, "set-maintenance-mode", "off")
+        ctx["maint"] = False
         ev(kind="stage", stage="final_checks", stageStatus="completed")
         ev(kind="terminal", outcome="success", message=f"Applied {summary}")
         log(f"managed update applied: {summary}")
@@ -719,6 +729,14 @@ def _apply_image(jid: str, run_type: str, target_image: str) -> None:
             log(f"rollback error: {re}")
             try:
                 ev(kind="terminal", outcome="failed", message=f"Rollback error: {str(re)[:160]}")
+            except Exception:
+                pass
+    finally:
+        # maintenance_mode persists in site_config across a DB restore — guarantee it's cleared so a
+        # rolled-back (or left-on-new-version for recovery) site is never left dark.
+        if ctx.get("maint"):
+            try:
+                _bench("--site", SITE, "set-maintenance-mode", "off")
             except Exception:
                 pass
 
