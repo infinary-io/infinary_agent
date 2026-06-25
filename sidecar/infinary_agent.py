@@ -496,6 +496,25 @@ def run_job(job: dict) -> None:
         else:
             _emit_action(job["id"], kind="terminal", outcome="skipped", message="No server-pinned agent artifact configured")
         return
+    if jtype in ("update_now", "app_update"):
+        # Apply the control-plane-CURATED same-major point updates via the same snapshot+rollback
+        # core as the scheduled engine. update_now = all pending (or the requested subset /
+        # security-only); app_update = the named apps. Empty curated list ⇒ "already up to date".
+        payload = job.get("payload", {}) or {}
+        wanted = set(payload.get("apps") or [])
+        updates = list(_pending_updates)
+        if wanted:
+            updates = [u for u in updates if u.get("name") in wanted]
+        if payload.get("securityOnly"):
+            updates = [u for u in updates if u.get("security")]
+        _apply_point_updates(job["id"], "action", updates)
+        return
+    if jtype == "app_install":
+        # Installing a NEW app means a rebuilt image on the compose/image topology — not something
+        # the in-place outbound agent can do. Report it clearly rather than blocking opaquely.
+        _emit_action(job["id"], kind="terminal", outcome="skipped",
+                     message="Installing a new app requires a rebuilt image on this deployment — handled by Infinary, not the in-place agent")
+        return
     handler = ACTION_HANDLERS.get(jtype)
     if handler is None:
         _emit_action(job["id"], kind="terminal", outcome="blocked", message=f"Unsupported job type: {jtype}")
@@ -586,13 +605,24 @@ def _point_image(updates: list[dict]) -> str:
 
 
 def run_managed_update(kind: str, run_type: str, updates: list[dict], scope: str | None) -> None:
-    """Snapshot → pinned-image apply → migrate → verify, rolling back on any failure."""
+    """Agent-INITIATED run: announce it (the control plane re-checks paused / plan / single-flight +
+    opens a durable ledger record), then apply on the returned jobId."""
     if not updates:
         return
     summary = ", ".join(f"{u['name']} {u['currentVersion']}->{u['availableVersion']}" for u in updates)
     jid = _begin_run(kind, scope, summary[:480])
     if not jid:
         return  # refused (paused / single-flight / plan) — retry next cycle
+    _apply_point_updates(jid, run_type, updates)
+
+
+def _apply_point_updates(jid: str, run_type: str, updates: list[dict]) -> None:
+    """Snapshot → pinned-image apply → migrate → verify, rolling back on any failure. The jobId is
+    already open — via /begin (auto/security) OR a pulled update_now / app_update job."""
+    if not updates:
+        emit(jid, runType=run_type, kind="terminal", outcome="success", message="Already up to date")
+        return
+    summary = ", ".join(f"{u['name']} {u['currentVersion']}->{u['availableVersion']}" for u in updates)
 
     def ev(**e):
         emit(jid, runType=run_type, **e)
