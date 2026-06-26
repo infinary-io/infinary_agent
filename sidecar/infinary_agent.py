@@ -83,7 +83,7 @@ TARGET_IMAGE_ENV = os.environ.get("INFINARY_TARGET_IMAGE", "")
 DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
-AGENT_VERSION = "0.7.2"
+AGENT_VERSION = "0.7.3"
 # The Frappe-app version is read from the live site fingerprint; this is only the
 # dry-run fallback (kept in sync with infinary_agent/__init__.py for local demos).
 AGENT_APP_VERSION_DRYRUN = "0.3.2"
@@ -516,16 +516,19 @@ def run_job(job: dict) -> None:
             _emit_action(job["id"], kind="terminal", outcome="skipped", message="No server-pinned agent artifact configured")
         return
     if jtype in ("update_now", "app_update"):
-        # Image-targeted: swap the compose image to the control-plane-CURATED target
-        # (APPROVED_FAC_IMAGE, delivered as `approvedImage` on the heartbeat), under snapshot +
-        # rollback. No approved image ⇒ nothing to apply; already on it ⇒ no-op success.
-        if not _approved_image:
-            _emit_action(job["id"], kind="terminal", outcome="skipped", message="No approved image configured (set APPROVED_FAC_IMAGE)")
+        # Image-targeted: swap the compose image to the control-plane-CURATED target, under snapshot +
+        # rollback. The control plane resolves the customer's per-app selection (checkboxes / Update-All)
+        # to the exact curated image and passes it as payload.targetImage; absent that we fall back to
+        # the all-latest `approvedImage` from the heartbeat. None ⇒ nothing to apply; already on it ⇒ no-op.
+        payload = job.get("payload") or {}
+        target = payload.get("targetImage") or _approved_image
+        if not target:
+            _emit_action(job["id"], kind="terminal", outcome="skipped", message="No target image configured (set APPROVED_FAC_IMAGE)")
             return
-        if _current_image_safe() == _approved_image:
-            _emit_action(job["id"], kind="terminal", outcome="success", message="Already on the approved image")
+        if _current_image_safe() == target:
+            _emit_action(job["id"], kind="terminal", outcome="success", message="Already on the target image")
             return
-        _apply_image(job["id"], "action", _approved_image)
+        _apply_image(job["id"], "action", target)
         return
     if jtype == "app_install":
         # Installing a NEW app means a rebuilt image on the compose/image topology — not something
