@@ -365,8 +365,9 @@ class ComposeDriver(_Driver):
             # Newest DB dump. The inner `*` is REQUIRED: sites with backup encryption write
             # `<ts>-<site>-database-enc.sql.gz`, so a bare `*-database.sql.gz` finds nothing and we'd
             # wrongly bail "no restorable backup" (bench auto-decrypts the -enc dump on restore).
+            # SITE is shell-quoted (globs stay outside the quotes) — the one place env reaches a shell string.
             out = _compose("exec", "-T", COMPOSE_SERVICE, "bash", "-lc",
-                           f"ls -t sites/{SITE}/private/backups/*-database*.sql.gz | head -1",
+                           f"ls -t sites/{shlex.quote(SITE)}/private/backups/*-database*.sql.gz | head -1",
                            timeout=120)
             ctx["db_backup"] = out.strip() or None
         except Exception as e:
@@ -654,7 +655,8 @@ def _apply_image(jid: str, run_type: str, target_image: str) -> None:
         _bench("--site", SITE, "backup", "--with-files")
         try:
             out = _compose("exec", "-T", COMPOSE_SERVICE, "bash", "-lc",
-                           f"ls -t sites/{SITE}/private/backups/*-database*.sql.gz | head -1", timeout=120)
+                           f"ls -t sites/{shlex.quote(SITE)}/private/backups/*-database*.sql.gz | head -1",
+                           timeout=120)
             ctx["db_backup"] = out.strip() or None
         except Exception as e:
             ctx["db_backup"] = None
