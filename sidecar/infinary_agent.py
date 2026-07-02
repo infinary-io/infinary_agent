@@ -504,7 +504,7 @@ ACTION_HANDLERS = {
 def run_job(job: dict) -> None:
     """Dispatch a pulled job by type: the 5-stage major upgrade, a simple action, or a
     staff-forced blue/green agent self-update."""
-    jtype = job.get("type")
+    jtype = str(job.get("type") or "")
     if jtype == "major_upgrade":
         run_upgrade(job)
         return
@@ -535,7 +535,8 @@ def run_job(job: dict) -> None:
         # Installing a NEW app means a rebuilt image on the compose/image topology — not something
         # the in-place outbound agent can do. Report it clearly rather than blocking opaquely.
         _emit_action(job["id"], kind="terminal", outcome="skipped",
-                     message="Installing a new app requires a rebuilt image on this deployment — handled by Infinary, not the in-place agent")
+                     message="Installing a new app requires a rebuilt image on this deployment — "
+                             "handled by Infinary, not the in-place agent")
         return
     handler = ACTION_HANDLERS.get(jtype)
     if handler is None:

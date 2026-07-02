@@ -78,7 +78,8 @@ def _db_customizations() -> tuple[str, dict]:
 
 
 def _version_vector() -> dict:
-    vv = {"frappe": "unknown", "erpnext": "unknown", "apps": {}}
+    apps: dict[str, str] = {}
+    vv: dict = {"frappe": "unknown", "erpnext": "unknown", "apps": apps}
     for app in frappe.get_installed_apps():
         try:
             ver = str(frappe.get_attr(f"{app}.__version__"))
@@ -87,7 +88,7 @@ def _version_vector() -> dict:
         if app in ("frappe", "erpnext"):
             vv[app] = ver
         else:
-            vv["apps"][app] = ver
+            apps[app] = ver
     return vv
 
 

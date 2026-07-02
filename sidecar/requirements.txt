@@ -1,1 +1,4 @@
-requests>=2.31
+# Pinned exactly — the sidecar runs unattended on customer VMs, so installs must
+# be reproducible. Bump deliberately: update the pin, let CI run the suite, ship
+# via the self-update artifact.
+requests==2.33.1

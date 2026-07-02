@@ -17,3 +17,33 @@ build-backend = "flit_core.buildapi"
 
 # Deliberately no [tool.bench.frappe-dependencies] version pin — this app installs
 # unchanged on the ERPNext versions Infinary manages (v15 and v16).
+
+[tool.ruff]
+target-version = "py310"
+line-length = 140  # the house style carries long rationale comments; hold this line
+extend-exclude = ["infinary_agent/infinary_agent"]  # Frappe module boilerplate
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "S"]  # pycodestyle, pyflakes, bugbear, pyupgrade, bandit
+ignore = [
+    "S603",  # subprocess without shell=True is the SAFE form; list-argv everywhere
+    "S607",  # bench/docker are resolved from PATH by design (bench boxes vary)
+    "S110",  # the bare swallows are deliberate fail-safe paths, documented inline
+    "S112",  # same, in loops (per-app fingerprint must not die on one bad app)
+    "E731",  # lambdas are used deliberately for tiny handlers
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # asserts are the point
+
+# Run mypy as TWO invocations (see .github/workflows/ci.yml):
+#   mypy sidecar/infinary_agent.py   and   mypy infinary_agent/api.py
+# A single run can't hold both — the sidecar script's module name shadows the
+# Frappe app package.
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true  # frappe is provided by the bench at runtime
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true

@@ -1,7 +1,8 @@
 app_name = "infinary_agent"
 app_title = "Infinary Agent"
 app_publisher = "Infinary"
-app_description = "Infinary's outbound site agent: the version vector + dual drift fingerprint a managed ERPNext instance reports home for safe upgrades."
+app_description = ("Infinary's outbound site agent: the version vector + dual drift fingerprint "
+                   "a managed ERPNext instance reports home for safe upgrades.")
 app_email = "ops@infinary.io"
 app_license = "MIT"
 
