@@ -83,7 +83,7 @@ TARGET_IMAGE_ENV = os.environ.get("INFINARY_TARGET_IMAGE", "")
 DB_ROOT_PASSWORD = os.environ.get("INFINARY_DB_ROOT_PASSWORD", "")
 PERIOD = int(os.environ.get("INFINARY_HEARTBEAT_SEC", "45"))
 DRYRUN = os.environ.get("INFINARY_DRYRUN") == "1"
-AGENT_VERSION = "0.7.3"
+AGENT_VERSION = "0.7.4"
 # The Frappe-app version is read from the live site fingerprint; this is only the
 # dry-run fallback (kept in sync with infinary_agent/__init__.py for local demos).
 AGENT_APP_VERSION_DRYRUN = "0.3.2"
@@ -839,11 +839,13 @@ def run_agent_self_update(artifact: dict, jid: str, run_type: str) -> None:
         if not (url and sha):
             ev(kind="terminal", outcome="skipped", message="Skipped: no server-pinned artifact")
             return
-        # download + verify checksum
+        # Download + verify checksum. Plain requests.get, NOT the S session: the control-plane
+        # bearer token must never leave its audience — the artifact host (GCS / signed URL)
+        # gets an unauthenticated GET, and integrity rests on the server-pinned sha256.
         tmp = tempfile.mkdtemp(prefix="infinary-agent-")
         archive = os.path.join(tmp, "agent.tgz")
         h = hashlib.sha256()
-        with S.get(url, stream=True, timeout=300) as resp:
+        with requests.get(url, stream=True, timeout=300) as resp:
             resp.raise_for_status()
             with open(archive, "wb") as f:
                 for chunk in resp.iter_content(65536):

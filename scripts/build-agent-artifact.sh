@@ -66,7 +66,7 @@ On each box, lay out the two-slot dir + point the service at the symlink:
   systemd ExecStart=/usr/bin/python3 /opt/infinary-agent/current/infinary_agent.py
   # and allow the restart the agent requests:  %agent% ALL=(root) NOPASSWD: /bin/systemctl restart infinary-agent
 
-NOTE: the agent uses one HTTP session, so its control-plane bearer token rides on the artifact
-GET too. Host the artifact on Google Cloud Storage (the token is instance-scoped + only valid
-against the control plane, and GCS ignores it). Use a signed URL if you don't want a public object.
+NOTE: the artifact GET is unauthenticated by design (sidecar >= 0.7.4 sends no control-plane
+bearer on it); integrity rests on the server-pinned sha256. Host on GCS public-read, or use a
+signed URL if you don't want a public object.
 EOF
